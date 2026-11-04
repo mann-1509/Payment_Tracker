@@ -451,6 +451,8 @@ function App() {
       <AnalyticsScreen
         accounts={accounts}
         token={token}
+        selectedAccountId={selectedAccount?.id ?? null}
+        onSelectAccount={setSelectedAccountId}
         onBack={() => setScreen('record')}
         onUnauthorized={() => handleUnauthorized('Session expired')}
       />
