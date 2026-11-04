@@ -10,11 +10,31 @@ const ACCOUNT_TYPES = ['bank', 'upi', 'cash'];
 const TRANSACTION_TYPES = ['debit', 'credit'];
 const MONTH_PATTERN = /^\d{4}-\d{2}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
-const activeTokens = new Set();
+let databaseReady = null;
+
+function ensureDatabaseReady() {
+  if (!databaseReady) {
+    databaseReady = initDatabase().catch((error) => {
+      databaseReady = null;
+      throw error;
+    });
+  }
+  return databaseReady;
+}
 
 app.use(cors());
 app.use(express.json());
+
+app.use(async (req, res, next) => {
+  try {
+    await ensureDatabaseReady();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 function getMonthKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
@@ -82,6 +102,33 @@ function timingSafeEqualStrings(first, second) {
   return crypto.timingSafeEqual(firstBuffer, secondBuffer);
 }
 
+function signSessionPayload(payload) {
+  return crypto.createHmac('sha256', process.env.APP_PIN).update(payload).digest('hex');
+}
+
+function createSessionToken() {
+  const expiresAt = String(Date.now() + SESSION_DURATION_MS);
+  return `${expiresAt}.${signSessionPayload(expiresAt)}`;
+}
+
+function isValidSessionToken(token) {
+  if (!token || !process.env.APP_PIN) {
+    return false;
+  }
+
+  const [expiresAt, signature] = token.split('.');
+
+  if (!expiresAt || !signature) {
+    return false;
+  }
+
+  if (!timingSafeEqualStrings(signature, signSessionPayload(expiresAt))) {
+    return false;
+  }
+
+  return Number(expiresAt) > Date.now();
+}
+
 app.post('/api/login', (req, res) => {
   const { pin } = req.body;
   const configuredPin = process.env.APP_PIN;
@@ -90,9 +137,7 @@ app.post('/api/login', (req, res) => {
     return res.status(401).json({ error: 'Wrong PIN' });
   }
 
-  const token = crypto.randomBytes(32).toString('hex');
-  activeTokens.add(token);
-  res.json({ token });
+  res.json({ token: createSessionToken() });
 });
 
 app.use('/api', (req, res, next) => {
@@ -105,7 +150,7 @@ app.use('/api', (req, res, next) => {
   const parts = authHeader.split(' ');
   const token = parts.length === 2 && /^bearer$/i.test(parts[0]) ? parts[1] : parts[0];
 
-  if (!token || !activeTokens.has(token)) {
+  if (!isValidSessionToken(token)) {
     return res.status(401).json({ error: 'Session expired' });
   }
 
@@ -363,13 +408,17 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-initDatabase()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Payments API running on http://localhost:${PORT}`);
+module.exports = app;
+
+if (require.main === module) {
+  ensureDatabaseReady()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Payments API running on http://localhost:${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error('Could not connect to the database:', error.message);
+      process.exit(1);
     });
-  })
-  .catch((error) => {
-    console.error('Could not connect to the database:', error.message);
-    process.exit(1);
-  });
+}

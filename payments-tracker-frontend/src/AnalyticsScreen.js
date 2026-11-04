@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-const API_URL = '/api';
+const API_URL = process.env.REACT_APP_API_URL || '/api';
 const TREND_MONTHS = 6;
 
 function getMonthKey(date) {

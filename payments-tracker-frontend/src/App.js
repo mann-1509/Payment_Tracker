@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import './App.css';
 import AnalyticsScreen from './AnalyticsScreen';
 
-const API_URL = '/api';
+const API_URL = process.env.REACT_APP_API_URL || '/api';
 const ACCOUNT_TYPES = ['bank', 'upi', 'cash'];
 const CATEGORIES = ['Food', 'Travel', 'Bills', 'Shopping', 'Other'];
 const DEFAULT_CATEGORY = 'Other';
