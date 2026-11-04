@@ -404,66 +404,6 @@ app.delete('/api/accounts/:id', async (req, res) => {
 });
 
 app.use((error, req, res, next) => {
-  app.get('/api/budgets/status', async (req, res) => {
-    const monthKey = resolveMonth(req.query.month);
-
-    if (!monthKey) {
-      return res.status(400).json({ error: 'month must be in YYYY-MM format' });
-    }
-
-    const accountId = resolveAccountId(req.query.account_id);
-    const accountCondition = accountId ? ' AND p.account_id = ?' : '';
-    const params = accountId ? [monthKey, accountId] : [monthKey];
-
-    const rows = await query(
-      `SELECT b.category,
-            b.monthly_limit::float8 AS monthly_limit,
-            COALESCE(SUM(p.amount), 0)::float8 AS spent
-     FROM budgets b
-     LEFT JOIN payments p
-       ON p.category = b.category
-      AND p.transaction_type = 'debit'
-      AND left(p.payment_date, 7) = ?${accountCondition}
-     GROUP BY b.category, b.monthly_limit
-     ORDER BY b.category`,
-      params
-    );
-
-    res.json(rows);
-  });
-
-  app.put('/api/budgets/:category', async (req, res) => {
-    const category = decodeURIComponent(req.params.category).trim();
-    const limit = Number(req.body.monthly_limit);
-
-    if (!category) {
-      return res.status(400).json({ error: 'category is required' });
-    }
-
-    if (!Number.isFinite(limit) || limit <= 0) {
-      return res.status(400).json({ error: 'monthly_limit must be greater than 0' });
-    }
-
-    const [saved] = await query(
-      `INSERT INTO budgets (category, monthly_limit) VALUES (?, ?)
-     ON CONFLICT (category) DO UPDATE SET monthly_limit = EXCLUDED.monthly_limit
-     RETURNING category, monthly_limit::float8 AS monthly_limit`,
-      [category, limit]
-    );
-
-    res.json(saved);
-  });
-
-  app.delete('/api/budgets/:category', async (req, res) => {
-    const category = decodeURIComponent(req.params.category).trim();
-    const deleted = await query('DELETE FROM budgets WHERE category = ? RETURNING category', [category]);
-
-    if (deleted.length === 0) {
-      return res.status(404).json({ error: 'Budget not found' });
-    }
-
-    res.json({ deleted: true });
-  });
   console.error(error);
   res.status(500).json({ error: 'Server error' });
 });

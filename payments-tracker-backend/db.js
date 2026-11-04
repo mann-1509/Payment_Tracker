@@ -59,11 +59,6 @@ async function initDatabase() {
       transaction_type TEXT NOT NULL DEFAULT 'debit' CHECK (transaction_type IN ('debit', 'credit')),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-
-    CREATE TABLE IF NOT EXISTS budgets (
-      category TEXT PRIMARY KEY,
-      monthly_limit DOUBLE PRECISION NOT NULL CHECK (monthly_limit > 0)
-    );
   `);
 }
 
