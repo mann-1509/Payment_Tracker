@@ -1440,3 +1440,75 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.text-action {
+  min-height: 44px;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: #ffd21f;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.budget-edit-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  border-bottom: 1px solid #1c1c1e;
+}
+
+.budget-input {
+  width: 130px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 12px;
+  background: #2c2c2e;
+  color: #ffffff;
+  font-size: 16px;
+  text-align: right;
+  outline: none;
+}
+
+.budget-input::placeholder {
+  color: #6a6a6a;
+}
+
+.budget-over {
+  font-size: 13px;
+  color: #ff453a;
+}
+
+.bar-fill-over {
+  background: #ff453a;
+}
+
+.budget-save {
+  flex: 1;
+  min-height: 44px;
+  border: none;
+  border-radius: 12px;
+  background: #ffd21f;
+  color: #000000;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.budget-save:disabled {
+  opacity: 0.6;
+}
+
+.sheet-cancel {
+  flex: 1;
+  min-height: 44px;
+  border: 1px solid #3a3a3c;
+  border-radius: 12px;
+  background: transparent;
+  color: #ffffff;
+  font-size: 15px;
+  cursor: pointer;
+}

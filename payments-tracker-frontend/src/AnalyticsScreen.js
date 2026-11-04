@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 const API_URL = 'https://payment-tracker-henna.vercel.app/api';
 const TREND_MONTHS = 6;
+const BUDGET_CATEGORIES = ['Food', 'Travel', 'Bills', 'Shopping', 'Other'];
 
 function getMonthKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
@@ -96,6 +97,90 @@ function AccountBanner({ selectedAccount, onCycle }) {
   );
 }
 
+function BudgetSection({
+  budgets,
+  monthLabel,
+  isEditing,
+  drafts,
+  isSaving,
+  budgetError,
+  onStartEdit,
+  onDraftChange,
+  onSave,
+  onCancel,
+}) {
+  return (
+    <section className="section">
+      <div className="section-header">
+        <h2>Budgets</h2>
+        {!isEditing && (
+          <button type="button" className="text-action" onClick={onStartEdit}>
+            Edit
+          </button>
+        )}
+      </div>
+      <span className="muted">{monthLabel}</span>
+
+      {isEditing ? (
+        <>
+          {BUDGET_CATEGORIES.map((category) => (
+            <div key={category} className="budget-edit-row">
+              <span className="category-name">{category}</span>
+              <input
+                className="budget-input"
+                type="text"
+                inputMode="decimal"
+                placeholder="No limit"
+                value={drafts[category] ?? ''}
+                onChange={(event) => onDraftChange(category, event.target.value)}
+              />
+            </div>
+          ))}
+          {budgetError && <p className="message">{budgetError}</p>}
+          <div className="sheet-actions">
+            <button type="button" className="sheet-cancel" onClick={onCancel} disabled={isSaving}>
+              Cancel
+            </button>
+            <button type="button" className="budget-save" onClick={onSave} disabled={isSaving}>
+              {isSaving ? 'Saving...' : 'Save'}
+            </button>
+          </div>
+        </>
+      ) : budgets.length === 0 ? (
+        <p className="empty-state">No budgets set. Tap Edit to add a monthly limit for each category.</p>
+      ) : (
+        budgets.map((budget) => {
+          const percent = budget.monthly_limit > 0 ? (budget.spent / budget.monthly_limit) * 100 : 0;
+          const isOver = budget.spent > budget.monthly_limit;
+          return (
+            <div key={budget.category} className="category-row">
+              <div className="category-top">
+                <div>
+                  <p className="category-name">{budget.category}</p>
+                  <p className={isOver ? 'budget-over' : 'muted'}>
+                    {isOver
+                      ? `Over by ${formatWhole(budget.spent - budget.monthly_limit)}`
+                      : `${formatWhole(budget.monthly_limit - budget.spent)} left`}
+                  </p>
+                </div>
+                <span className="category-amount">
+                  {formatWhole(budget.spent)} / {formatWhole(budget.monthly_limit)}
+                </span>
+              </div>
+              <div className="bar-track">
+                <div
+                  className={`bar-fill ${isOver ? 'bar-fill-over' : ''}`}
+                  style={{ width: `${Math.min(percent, 100)}%` }}
+                />
+              </div>
+            </div>
+          );
+        })
+      )}
+    </section>
+  );
+}
+
 export default function AnalyticsScreen({
   accounts,
   token,
@@ -110,6 +195,11 @@ export default function AnalyticsScreen({
   const [summary, setSummary] = useState(null);
   const [trend, setTrend] = useState([]);
   const [history, setHistory] = useState([]);
+  const [budgets, setBudgets] = useState([]);
+  const [isEditingBudgets, setIsEditingBudgets] = useState(false);
+  const [budgetDrafts, setBudgetDrafts] = useState({});
+  const [isSavingBudgets, setIsSavingBudgets] = useState(false);
+  const [budgetError, setBudgetError] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [refreshKey, setRefreshKey] = useState(0);
   const [pendingDelete, setPendingDelete] = useState(null);
@@ -135,6 +225,18 @@ export default function AnalyticsScreen({
         setTrend(trendData);
         setErrorMessage('');
       })
+      .catch((error) => {
+        if (error.message !== 'Session expired') {
+          setErrorMessage('Backend not reachable');
+        }
+      });
+  }, [monthKey, analyticsAccountId, refreshKey]);
+
+  useEffect(() => {
+    const accountQuery = analyticsAccountId ? `&account_id=${analyticsAccountId}` : '';
+
+    requestJson(`${API_URL}/budgets/status?month=${monthKey}${accountQuery}`, token, {}, onUnauthorized)
+      .then((data) => setBudgets(data))
       .catch((error) => {
         if (error.message !== 'Session expired') {
           setErrorMessage('Backend not reachable');
@@ -175,6 +277,83 @@ export default function AnalyticsScreen({
 
   const getAccountName = (accountId) =>
     accounts.find((account) => account.id === accountId)?.name ?? 'No account';
+
+  const startBudgetEdit = () => {
+    const initialDrafts = {};
+
+    BUDGET_CATEGORIES.forEach((category) => {
+      const existing = budgets.find((budget) => budget.category === category);
+      initialDrafts[category] = existing ? String(existing.monthly_limit) : '';
+    });
+
+    setBudgetDrafts(initialDrafts);
+    setBudgetError('');
+    setIsEditingBudgets(true);
+  };
+
+  const updateBudgetDraft = (category, value) => {
+    setBudgetDrafts((current) => ({ ...current, [category]: value }));
+  };
+
+  const cancelBudgetEdit = () => {
+    setIsEditingBudgets(false);
+    setBudgetError('');
+  };
+
+  const saveBudgets = async () => {
+    const invalidCategory = BUDGET_CATEGORIES.find((category) => {
+      const text = (budgetDrafts[category] ?? '').trim();
+      return text !== '' && (!Number.isFinite(Number(text)) || Number(text) <= 0);
+    });
+
+    if (invalidCategory) {
+      setBudgetError(`Enter a valid limit for ${invalidCategory}`);
+      return;
+    }
+
+    setIsSavingBudgets(true);
+    setBudgetError('');
+
+    try {
+      await Promise.all(
+        BUDGET_CATEGORIES.map((category) => {
+          const text = (budgetDrafts[category] ?? '').trim();
+          const existing = budgets.find((budget) => budget.category === category);
+          const categoryUrl = `${API_URL}/budgets/${encodeURIComponent(category)}`;
+
+          if (text === '') {
+            return existing
+              ? requestJson(categoryUrl, token, { method: 'DELETE' }, onUnauthorized)
+              : Promise.resolve();
+          }
+
+          if (existing && Number(existing.monthly_limit) === Number(text)) {
+            return Promise.resolve();
+          }
+
+          return requestJson(
+            categoryUrl,
+            token,
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ monthly_limit: Number(text) }),
+            },
+            onUnauthorized
+          );
+        })
+      );
+
+      setIsEditingBudgets(false);
+      setRefreshKey((current) => current + 1);
+    } catch (error) {
+      if (error.message !== 'Session expired') {
+        setBudgetError('Could not save budgets. Try again.');
+      }
+    } finally {
+      setIsSavingBudgets(false);
+    }
+  };
 
   const requestDelete = (payment) => {
     setDeleteError('');
@@ -518,6 +697,19 @@ export default function AnalyticsScreen({
           </section>
         </>
       )}
+
+      <BudgetSection
+        budgets={budgets}
+        monthLabel={`${currentMonthName} ${currentYear}`}
+        isEditing={isEditingBudgets}
+        drafts={budgetDrafts}
+        isSaving={isSavingBudgets}
+        budgetError={budgetError}
+        onStartEdit={startBudgetEdit}
+        onDraftChange={updateBudgetDraft}
+        onSave={saveBudgets}
+        onCancel={cancelBudgetEdit}
+      />
 
       <button type="button" className="history-button" onClick={() => setView('history')}>
         View full payment history
