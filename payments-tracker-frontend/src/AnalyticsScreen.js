@@ -51,50 +51,123 @@ function RupeeTotal({ value }) {
   );
 }
 
-export default function AnalyticsScreen({ accounts, onBack }) {
+export default function AnalyticsScreen({ accounts, token, onBack, onUnauthorized }) {
   const [monthKey, setMonthKey] = useState(getMonthKey(new Date()));
   const [accountIndex, setAccountIndex] = useState(-1);
   const [summary, setSummary] = useState(null);
   const [trend, setTrend] = useState([]);
   const [errorMessage, setErrorMessage] = useState('');
 
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [isDeletingPayment, setIsDeletingPayment] = useState(false);
+  const [sheetError, setSheetError] = useState('');
+
   const selectedAccount = accountIndex >= 0 ? accounts[accountIndex] : null;
   const selectedAccountId = selectedAccount?.id ?? null;
 
   useEffect(() => {
-    const accountQuery = selectedAccountId ? `&account_id=${selectedAccountId}` : '';
+    if (accountIndex >= 0 && (!selectedAccount || !accounts.some((acc) => acc.id === selectedAccountId))) {
+      setAccountIndex(-1);
+    }
+  }, [accounts, accountIndex, selectedAccount, selectedAccountId]);
 
-    Promise.all([
-      fetch(`${API_URL}/analytics?month=${monthKey}${accountQuery}`).then((response) => response.json()),
-      fetch(`${API_URL}/analytics/trend?month=${monthKey}&months=${TREND_MONTHS}${accountQuery}`).then((response) =>
-        response.json()
-      ),
-    ])
-      .then(([summaryData, trendData]) => {
-        setSummary(summaryData);
-        setTrend(trendData);
-        setErrorMessage('');
-      })
-      .catch(() => setErrorMessage('Backend not reachable'));
-  }, [monthKey, selectedAccountId]);
+  const loadAnalyticsData = async () => {
+    const accountQuery = selectedAccountId ? `&account_id=${selectedAccountId}` : '';
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+
+    try {
+      const [summaryRes, trendRes] = await Promise.all([
+        fetch(`${API_URL}/analytics?month=${monthKey}${accountQuery}`, { headers }),
+        fetch(`${API_URL}/analytics/trend?month=${monthKey}&months=${TREND_MONTHS}${accountQuery}`, { headers }),
+      ]);
+
+      if (summaryRes.status === 401 || trendRes.status === 401) {
+        onUnauthorized();
+        return;
+      }
+
+      if (!summaryRes.ok || !trendRes.ok) {
+        throw new Error('Analytics failed');
+      }
+
+      const summaryData = await summaryRes.json();
+      const trendData = await trendRes.json();
+      setSummary(summaryData);
+      setTrend(trendData);
+      setErrorMessage('');
+    } catch (err) {
+      setErrorMessage('Backend not reachable');
+    }
+  };
+
+  useEffect(() => {
+    loadAnalyticsData();
+  }, [monthKey, selectedAccountId, token]);
 
   const cycleAccount = () => {
     setAccountIndex((current) => (current + 1 >= accounts.length ? -1 : current + 1));
   };
 
-  const total = summary?.total_spent ?? 0;
+  const openDeleteSheet = (payment) => {
+    setSheetError('');
+    setPendingDelete(payment);
+  };
+
+  const closeDeleteSheet = () => {
+    if (isDeletingPayment) return;
+    setPendingDelete(null);
+    setSheetError('');
+  };
+
+  const confirmDeletePayment = async () => {
+    if (!pendingDelete) return;
+
+    setIsDeletingPayment(true);
+    setSheetError('');
+
+    try {
+      const response = await fetch(`${API_URL}/payments/${pendingDelete.id}`, {
+        method: 'DELETE',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error('Delete failed');
+      }
+
+      setPendingDelete(null);
+      await loadAnalyticsData();
+    } catch (err) {
+      setSheetError("Could not delete payment. Try again.");
+    } finally {
+      setIsDeletingPayment(false);
+    }
+  };
+
+  const totalSpent = summary?.total_spent ?? summary?.total_debit ?? 0;
+  const totalIncome = summary?.total_credit ?? summary?.total_income ?? 0;
+  const netBalance = summary?.net_balance ?? (totalIncome - totalSpent);
   const paymentCount = summary?.payment_count ?? 0;
-  const averagePayment = summary?.average_payment ?? 0;
+  const debitCount = summary?.debit_count ?? 0;
+  const creditCount = summary?.credit_count ?? 0;
+  const averageDebit = summary?.average_payment ?? 0;
   const previousTotal = summary?.previous_month_total ?? 0;
   const categories = summary?.categories ?? [];
   const largestPayments = summary?.largest_payments ?? [];
   const largestTotal = largestPayments.reduce((sum, payment) => sum + payment.amount, 0);
-  const otherCount = paymentCount - largestPayments.length;
-  const otherTotal = total - largestTotal;
-  const changePercent = previousTotal > 0 ? ((total - previousTotal) / previousTotal) * 100 : null;
-  const highestTrend = Math.max(...trend.map((item) => item.total), 0);
-  const highestTrendItem = trend.find((item) => highestTrend > 0 && item.total === highestTrend);
-  const isCurrentHighest = highestTrendItem?.month === monthKey;
+  const otherDebitCount = debitCount - largestPayments.length;
+  const otherDebitTotal = totalSpent - largestTotal;
+  const changePercent = previousTotal > 0 ? ((totalSpent - previousTotal) / previousTotal) * 100 : null;
+
+  const highestTrend = Math.max(
+    ...trend.map((item) => Math.max(item.debit ?? item.total ?? 0, item.credit ?? item.total_income ?? 0)),
+    0
+  );
   const currentMonthName = formatMonth(monthKey, { month: 'long' });
   const currentYear = formatMonth(monthKey, { year: 'numeric' });
   const previousMonthName = formatMonth(shiftMonthKey(monthKey, -1), { month: 'long' });
@@ -148,40 +221,60 @@ export default function AnalyticsScreen({ accounts, onBack }) {
 
       <section className="summary-block">
         <div className="summary-header">
-          <span className="field-label">Total payments recorded</span>
+          <span className="field-label">Total expenses (Debit)</span>
           <span className="currency-tag">INR</span>
         </div>
-        <RupeeTotal value={total} />
+        <RupeeTotal value={totalSpent} />
         {changePercent === null ? (
-          <p className="muted">No payments recorded in {previousMonthName}</p>
+          <p className="muted">No debit expenses recorded in {previousMonthName}</p>
         ) : (
           <>
             <p className={changePercent >= 0 ? 'trend-up' : 'trend-down'}>
               {changePercent >= 0 ? '▲' : '▼'} {Math.abs(changePercent).toFixed(1)}%{' '}
-              {changePercent >= 0 ? 'more' : 'less'} than {previousMonthName}
+              {changePercent >= 0 ? 'more' : 'less'} spending than {previousMonthName}
             </p>
             <p className="muted">
-              {formatWhole(Math.abs(total - previousTotal))} {total >= previousTotal ? 'more' : 'less'} ·{' '}
-              {previousMonthName} total {formatWhole(previousTotal)}
+              {formatWhole(Math.abs(totalSpent - previousTotal))} {totalSpent >= previousTotal ? 'more' : 'less'} ·{' '}
+              {previousMonthName} spending {formatWhole(previousTotal)}
             </p>
           </>
         )}
       </section>
 
+      <section className="balance-grid">
+        <div className="balance-card income-card">
+          <span className="field-label">Total income (Credit)</span>
+          <span className="balance-value income-value">{formatWhole(totalIncome)}</span>
+          <span className="balance-sub">{creditCount} credit {creditCount === 1 ? 'transaction' : 'transactions'}</span>
+        </div>
+        <div className="balance-card net-card">
+          <span className="field-label">Net balance</span>
+          <span className={`balance-value ${netBalance >= 0 ? 'net-positive' : 'net-negative'}`}>
+            {netBalance >= 0 ? `+${formatWhole(netBalance)}` : `-₹ ${Math.abs(Math.round(netBalance)).toLocaleString('en-IN')}`}
+          </span>
+          <span className="balance-sub">Income − Expenses</span>
+        </div>
+      </section>
+
       <section className="stats-card">
         <div>
-          <span className="field-label">Payments</span>
-          <span className="stat-value">{paymentCount}</span>
+          <span className="field-label">Debits</span>
+          <span className="stat-value">{debitCount}</span>
         </div>
         <div className="stat-divider" />
         <div>
-          <span className="field-label">Average payment</span>
-          <span className="stat-value">{formatWhole(averagePayment)}</span>
+          <span className="field-label">Average expense</span>
+          <span className="stat-value">{formatWhole(averageDebit)}</span>
+        </div>
+        <div className="stat-divider" />
+        <div>
+          <span className="field-label">Total transactions</span>
+          <span className="stat-value">{paymentCount}</span>
         </div>
       </section>
 
       {paymentCount === 0 ? (
-        <p className="empty-state">No payments recorded for this month.</p>
+        <p className="empty-state">No transactions recorded for this month.</p>
       ) : (
         <>
           <section className="section">
@@ -189,21 +282,41 @@ export default function AnalyticsScreen({ accounts, onBack }) {
               <h2>Monthly trend</h2>
               <span className="muted">Last {TREND_MONTHS} months</span>
             </div>
-            <span className="muted">Recorded payments · ₹ thousands</span>
-            <div className="trend-chart">
+            <div className="trend-legend">
+              <span className="legend-item"><span className="legend-dot dot-expense" /> Expense (Debit)</span>
+              <span className="legend-item"><span className="legend-dot dot-income" /> Income (Credit)</span>
+            </div>
+            <span className="muted">Recorded amounts · ₹ thousands</span>
+            <div className="trend-chart dual-trend-chart">
               {trend.map((item) => {
                 const isCurrent = item.month === monthKey;
-                const heightPercent = highestTrend > 0 ? (item.total / highestTrend) * 100 : 0;
+                const debitAmount = item.debit ?? item.total ?? 0;
+                const creditAmount = item.credit ?? item.total_income ?? 0;
+                const debitHeight = highestTrend > 0 ? (debitAmount / highestTrend) * 100 : 0;
+                const creditHeight = highestTrend > 0 ? (creditAmount / highestTrend) * 100 : 0;
+
                 return (
                   <div key={item.month} className="trend-column">
-                    <span className={`trend-value ${isCurrent ? 'trend-current' : ''}`}>
-                      {item.total > 0 ? (item.total / 1000).toFixed(1) : ''}
-                    </span>
-                    <div className="trend-track">
-                      <div
-                        className={`trend-bar ${isCurrent ? 'trend-bar-current' : ''}`}
-                        style={{ height: `${heightPercent}%` }}
-                      />
+                    <div className="trend-values-group">
+                      <span className={`trend-value ${isCurrent ? 'trend-current' : ''}`}>
+                        {debitAmount > 0 ? (debitAmount / 1000).toFixed(1) : ''}
+                      </span>
+                    </div>
+                    <div className="trend-track-group">
+                      <div className="trend-track">
+                        <div
+                          className={`trend-bar expense-bar ${isCurrent ? 'trend-bar-current' : ''}`}
+                          style={{ height: `${debitHeight}%` }}
+                          title={`Debit: ₹${debitAmount}`}
+                        />
+                      </div>
+                      <div className="trend-track">
+                        <div
+                          className="trend-bar income-bar"
+                          style={{ height: `${creditHeight}%` }}
+                          title={`Credit: ₹${creditAmount}`}
+                        />
+                      </div>
                     </div>
                     <span className={`trend-label ${isCurrent ? 'trend-current' : ''}`}>
                       {formatMonth(item.month, { month: 'short' })}
@@ -212,71 +325,114 @@ export default function AnalyticsScreen({ accounts, onBack }) {
                 );
               })}
             </div>
-            {isCurrentHighest && (
-              <p className="callout">
-                {currentMonthName} has the highest recorded total in this six-month view.
-              </p>
-            )}
           </section>
 
           <section className="section">
             <div className="section-header">
-              <h2>By category</h2>
+              <h2>Expenses by category</h2>
               <span className="muted">
                 {currentMonthName} {currentYear}
               </span>
             </div>
-            {categories.map((item) => (
-              <div key={item.category} className="category-row">
-                <div className="category-top">
-                  <div>
-                    <p className="category-name">{item.category}</p>
-                    <p className="muted">
-                      {item.count} {item.count === 1 ? 'payment' : 'payments'} · {item.share.toFixed(1)}%
-                    </p>
+            {categories.length === 0 ? (
+              <p className="empty-state">No debit expenses in this month.</p>
+            ) : (
+              categories.map((item) => (
+                <div key={item.category} className="category-row">
+                  <div className="category-top">
+                    <div>
+                      <p className="category-name">{item.category}</p>
+                      <p className="muted">
+                        {item.count} {item.count === 1 ? 'expense' : 'expenses'} · {item.share.toFixed(1)}%
+                      </p>
+                    </div>
+                    <span className="category-amount">{formatWhole(item.total)}</span>
                   </div>
-                  <span className="category-amount">{formatWhole(item.total)}</span>
+                  <div className="bar-track">
+                    <div className="bar-fill" style={{ width: `${item.share}%` }} />
+                  </div>
                 </div>
-                <div className="bar-track">
-                  <div className="bar-fill" style={{ width: `${item.share}%` }} />
-                </div>
-              </div>
-            ))}
+              ))
+            )}
             <div className="footer-row">
-              <span className="muted">All {paymentCount} payments</span>
-              <span className="yellow-amount">{formatWhole(total)}</span>
+              <span className="muted">All {debitCount} debit {debitCount === 1 ? 'expense' : 'expenses'}</span>
+              <span className="yellow-amount">{formatWhole(totalSpent)}</span>
             </div>
           </section>
 
           <section className="section">
             <div className="section-header">
-              <h2>Largest payments</h2>
+              <h2>Largest expenses</h2>
               <span className="muted">
-                Top {largestPayments.length} of {paymentCount}
+                Top {largestPayments.length} of {debitCount}
               </span>
             </div>
-            {largestPayments.map((payment) => (
-              <div key={payment.id} className="largest-row">
-                <span className="payment-icon">{getInitial(payment.category)}</span>
-                <div className="largest-info">
-                  <p className="category-name">{payment.note || payment.category}</p>
-                  <p className="muted">
-                    {formatShortDate(payment.payment_date)} · {payment.category}
-                  </p>
+            {largestPayments.length === 0 ? (
+              <p className="empty-state">No expenses to display.</p>
+            ) : (
+              largestPayments.map((payment) => (
+                <div key={payment.id} className="largest-row">
+                  <span className="payment-icon">{getInitial(payment.category)}</span>
+                  <div className="largest-info">
+                    <p className="category-name">{payment.note || payment.category}</p>
+                    <p className="muted">
+                      {formatShortDate(payment.payment_date)} · {payment.category}
+                    </p>
+                  </div>
+                  <span className="category-amount">{formatWhole(payment.amount)}</span>
+                  <button
+                    type="button"
+                    className="row-delete-btn"
+                    onClick={() => openDeleteSheet(payment)}
+                    aria-label="Delete payment"
+                  >
+                    ×
+                  </button>
                 </div>
-                <span className="category-amount">{formatWhole(payment.amount)}</span>
-              </div>
-            ))}
-            {otherCount > 0 && (
+              ))
+            )}
+            {otherDebitCount > 0 && (
               <div className="footer-row">
                 <span className="muted">
-                  Other {otherCount} {otherCount === 1 ? 'payment' : 'payments'}
+                  Other {otherDebitCount} {otherDebitCount === 1 ? 'expense' : 'expenses'}
                 </span>
-                <span>{formatWhole(otherTotal)}</span>
+                <span>{formatWhole(otherDebitTotal)}</span>
               </div>
             )}
           </section>
         </>
+      )}
+
+      {pendingDelete && (
+        <div className="sheet-overlay" onClick={closeDeleteSheet}>
+          <div className="sheet" onClick={(event) => event.stopPropagation()}>
+            <h2 className="sheet-title">Delete this payment?</h2>
+            <div className="sheet-details">
+              <span className="sheet-amount">{formatWhole(pendingDelete.amount)}</span>
+              <span className="sheet-date">{formatShortDate(pendingDelete.payment_date)} · {pendingDelete.category}</span>
+            </div>
+            <p className="sheet-message">It will be removed from history and analytics. This can't be undone.</p>
+            {sheetError && <p className="message sheet-error">{sheetError}</p>}
+            <div className="sheet-actions">
+              <button
+                type="button"
+                className="sheet-cancel"
+                onClick={closeDeleteSheet}
+                disabled={isDeletingPayment}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="sheet-delete"
+                onClick={confirmDeletePayment}
+                disabled={isDeletingPayment}
+              >
+                {isDeletingPayment ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       <p className="footnote">Your records, at a glance.</p>

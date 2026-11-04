@@ -4,6 +4,7 @@ import AnalyticsScreen from './AnalyticsScreen';
 
 const API_URL = '/api';
 const ACCOUNT_TYPES = ['bank', 'upi', 'cash'];
+const CATEGORIES = ['Food', 'Travel', 'Bills', 'Shopping', 'Other'];
 const DEFAULT_CATEGORY = 'Other';
 
 function getTodayDate() {
@@ -37,7 +38,7 @@ function AccountCard({ account, isOpen, onToggle }) {
   );
 }
 
-function AccountPicker({ accounts, selectedAccountId, onSelect, onCreate }) {
+function AccountPicker({ accounts, selectedAccountId, onSelect, onCreate, onDeleteClick }) {
   const [newName, setNewName] = useState('');
   const [newType, setNewType] = useState('bank');
   const [isAdding, setIsAdding] = useState(false);
@@ -66,15 +67,30 @@ function AccountPicker({ accounts, selectedAccountId, onSelect, onCreate }) {
   return (
     <div className="account-picker">
       {accounts.map((account) => (
-        <button
+        <div
           key={account.id}
-          type="button"
-          className={`account-option ${account.id === selectedAccountId ? 'account-option-active' : ''}`}
-          onClick={() => onSelect(account.id)}
+          className={`account-row ${account.id === selectedAccountId ? 'account-row-active' : ''}`}
         >
-          <span>{account.name}</span>
-          <span className="account-type">{account.type}</span>
-        </button>
+          <button
+            type="button"
+            className="account-row-select"
+            onClick={() => onSelect(account.id)}
+          >
+            <span>{account.name}</span>
+            <span className="account-type">{account.type}</span>
+          </button>
+          <button
+            type="button"
+            className="account-delete-button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDeleteClick(account);
+            }}
+            aria-label={`Delete ${account.name}`}
+          >
+            Delete
+          </button>
+        </div>
       ))}
 
       {isAdding ? (
@@ -112,51 +128,261 @@ function AccountPicker({ accounts, selectedAccountId, onSelect, onCreate }) {
   );
 }
 
+function DeleteAccountDialog({ account, paymentCount, isDeleting, errorMessage, onConfirm, onCancel }) {
+  return (
+    <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <div className="modal-content">
+        <h2 id="dialog-title" className="modal-title">Delete Account</h2>
+        <p className="modal-text">
+          Delete {account.name}? This also deletes all {paymentCount} payments in it. This cannot be undone.
+        </p>
+        {errorMessage && <p className="message modal-error">{errorMessage}</p>}
+        <div className="modal-actions">
+          <button
+            type="button"
+            className="modal-button modal-button-cancel"
+            onClick={onCancel}
+            disabled={isDeleting}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="modal-button modal-button-danger"
+            onClick={onConfirm}
+            disabled={isDeleting}
+          >
+            {isDeleting ? 'Deleting...' : 'Delete'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PinScreen({ onLoginSuccess, initialMessage }) {
+  const [pin, setPin] = useState('');
+  const [errorMessage, setErrorMessage] = useState(initialMessage || '');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handlePinChange = (event) => {
+    const value = event.target.value.replace(/\D/g, '').slice(0, 4);
+    setPin(value);
+  };
+
+  const handleUnlock = async (event) => {
+    event.preventDefault();
+    if (pin.length !== 4) {
+      setErrorMessage('Enter a 4-digit PIN');
+      return;
+    }
+
+    setIsLoading(true);
+    setErrorMessage('');
+
+    try {
+      const response = await fetch(`${API_URL}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin }),
+      });
+
+      if (!response.ok) {
+        setErrorMessage('Wrong PIN');
+        setPin('');
+        return;
+      }
+
+      const data = await response.json();
+      onLoginSuccess(data.token);
+    } catch (err) {
+      setErrorMessage('Backend not reachable');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="screen pin-screen">
+      <div className="pin-container">
+        <div className="pin-brand">MANN</div>
+        <h1 className="pin-title">Enter PIN</h1>
+        <p className="pin-subtitle">Enter your 4-digit PIN to access your payments.</p>
+
+        <form onSubmit={handleUnlock} className="pin-form">
+          <input
+            className="pin-input"
+            type="password"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            maxLength={4}
+            placeholder="••••"
+            value={pin}
+            onChange={handlePinChange}
+            autoFocus
+          />
+
+          {errorMessage && <p className="message pin-error">{errorMessage}</p>}
+
+          <button type="submit" className="save-button pin-button" disabled={isLoading || pin.length !== 4}>
+            <span>{isLoading ? 'Verifying...' : 'Unlock'}</span>
+            <span className="plus-symbol">→</span>
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  const [token, setToken] = useState(null);
+  const [authError, setAuthError] = useState('');
   const [screen, setScreen] = useState('record');
   const [accounts, setAccounts] = useState([]);
   const [selectedAccountId, setSelectedAccountId] = useState(null);
   const [isPickerOpen, setIsPickerOpen] = useState(false);
+  const [transactionType, setTransactionType] = useState('debit');
   const [amount, setAmount] = useState('');
+  const [category, setCategory] = useState(DEFAULT_CATEGORY);
   const [paymentDate, setPaymentDate] = useState(getTodayDate());
   const [note, setNote] = useState('');
   const [message, setMessage] = useState('');
   const [isSaving, setIsSaving] = useState(false);
 
+  const [deletingAccount, setDeletingAccount] = useState(null);
+  const [deletingPaymentCount, setDeletingPaymentCount] = useState(0);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [deleteDialogError, setDeleteDialogError] = useState('');
+
   const selectedAccount =
     accounts.find((account) => account.id === selectedAccountId) ?? accounts[0] ?? null;
   const dateParts = getDateParts(paymentDate);
 
-  const loadAccounts = async () => {
-    const response = await fetch(`${API_URL}/accounts`);
-    const data = await response.json();
-    setAccounts(data);
-    setSelectedAccountId((current) => current ?? data[0]?.id ?? null);
-    return data;
+  const handleUnauthorized = (msg = 'Session expired') => {
+    setToken(null);
+    setAuthError(msg);
+  };
+
+  const loadAccounts = async (authToken = token) => {
+    if (!authToken) return [];
+    try {
+      const response = await fetch(`${API_URL}/accounts`, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (response.status === 401) {
+        handleUnauthorized('Session expired');
+        return [];
+      }
+      if (!response.ok) {
+        throw new Error('Failed to load accounts');
+      }
+      const data = await response.json();
+      setAccounts(data);
+      setSelectedAccountId((current) => current ?? data[0]?.id ?? null);
+      return data;
+    } catch (err) {
+      if (token) setMessage('Backend not reachable');
+      return [];
+    }
   };
 
   useEffect(() => {
-    loadAccounts().catch(() => setMessage('Backend not reachable'));
-  }, []);
+    if (token) {
+      loadAccounts(token);
+    }
+  }, [token]);
+
+  const onLoginSuccess = (newToken) => {
+    setToken(newToken);
+    setAuthError('');
+    loadAccounts(newToken);
+  };
 
   const createAccount = async (name, type) => {
     try {
       const response = await fetch(`${API_URL}/accounts`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ name, type }),
       });
+
+      if (response.status === 401) {
+        handleUnauthorized('Session expired');
+        return false;
+      }
 
       if (!response.ok) {
         return false;
       }
 
       const createdAccount = await response.json();
-      await loadAccounts();
+      await loadAccounts(token);
       setSelectedAccountId(createdAccount.id);
       return true;
     } catch (error) {
       return false;
+    }
+  };
+
+  const openDeleteDialog = async (account) => {
+    setDeleteDialogError('');
+    setDeletingAccount(account);
+    setDeletingPaymentCount(0);
+
+    try {
+      const response = await fetch(`${API_URL}/payments?account_id=${account.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 401) {
+        handleUnauthorized('Session expired');
+        return;
+      }
+      if (response.ok) {
+        const payments = await response.json();
+        setDeletingPaymentCount(payments.length);
+      }
+    } catch (err) {
+      setDeletingPaymentCount(0);
+    }
+  };
+
+  const confirmDeleteAccount = async () => {
+    if (!deletingAccount) return;
+
+    setIsDeletingAccount(true);
+    setDeleteDialogError('');
+
+    try {
+      const response = await fetch(`${API_URL}/accounts/${deletingAccount.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (response.status === 401) {
+        handleUnauthorized('Session expired');
+        return;
+      }
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to delete account');
+      }
+
+      const remainingAccounts = accounts.filter((account) => account.id !== deletingAccount.id);
+      setAccounts(remainingAccounts);
+
+      if (selectedAccountId === deletingAccount.id) {
+        setSelectedAccountId(remainingAccounts[0]?.id ?? null);
+      }
+
+      setDeletingAccount(null);
+    } catch (err) {
+      setDeleteDialogError(err.message || 'Could not delete account');
+    } finally {
+      setIsDeletingAccount(false);
     }
   };
 
@@ -179,32 +405,56 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/payments`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           amount: numericAmount,
-          category: DEFAULT_CATEGORY,
+          category,
           payment_date: paymentDate,
           account_id: selectedAccount.id,
           note,
+          type: transactionType,
+          transaction_type: transactionType,
         }),
       });
 
+      if (response.status === 401) {
+        handleUnauthorized('Session expired');
+        return;
+      }
+
       if (!response.ok) {
-        throw new Error('Save failed');
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Save failed');
       }
 
       setAmount('');
+      setCategory(DEFAULT_CATEGORY);
+      setTransactionType('debit');
       setNote('');
-      setMessage('Payment recorded');
+      setMessage(transactionType === 'credit' ? 'Credit payment recorded' : 'Debit payment recorded');
     } catch (error) {
-      setMessage('Could not save payment');
+      setMessage(error.message || 'Could not save payment');
     } finally {
       setIsSaving(false);
     }
   };
 
+  if (!token) {
+    return <PinScreen onLoginSuccess={onLoginSuccess} initialMessage={authError} />;
+  }
+
   if (screen === 'analytics') {
-    return <AnalyticsScreen accounts={accounts} onBack={() => setScreen('record')} />;
+    return (
+      <AnalyticsScreen
+        accounts={accounts}
+        token={token}
+        onBack={() => setScreen('record')}
+        onUnauthorized={() => handleUnauthorized('Session expired')}
+      />
+    );
   }
 
   return (
@@ -215,6 +465,8 @@ function App() {
           className="back-button"
           onClick={() => {
             setAmount('');
+            setCategory(DEFAULT_CATEGORY);
+            setTransactionType('debit');
             setNote('');
             setMessage('');
           }}
@@ -230,21 +482,62 @@ function App() {
         </button>
       </header>
 
+      <section className="transaction-type-container">
+        <div className="transaction-type-toggle" role="radiogroup" aria-label="Transaction Type">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={transactionType === 'debit'}
+            className={`type-toggle-btn debit-btn ${transactionType === 'debit' ? 'active' : ''}`}
+            onClick={() => setTransactionType('debit')}
+          >
+            <span className="type-dot debit-dot" />
+            Debit
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={transactionType === 'credit'}
+            className={`type-toggle-btn credit-btn ${transactionType === 'credit' ? 'active' : ''}`}
+            onClick={() => setTransactionType('credit')}
+          >
+            <span className="type-dot credit-dot" />
+            Credit
+          </button>
+        </div>
+      </section>
+
       <section className="field">
         <div className="field-header">
-          <span className="field-label">Amount</span>
+          <span className="field-label">{transactionType === 'credit' ? 'Income Amount' : 'Amount'}</span>
           <span className="currency-tag">INR</span>
         </div>
         <div className="amount-row">
-          <span className="rupee-symbol">₹</span>
+          <span className={`rupee-symbol ${transactionType === 'credit' ? 'credit-symbol' : ''}`}>₹</span>
           <input
-            className="amount-input"
+            className={`amount-input ${transactionType === 'credit' ? 'credit-symbol' : ''}`}
             type="text"
             inputMode="decimal"
             placeholder="0"
             value={amount}
             onChange={(event) => setAmount(event.target.value)}
           />
+        </div>
+      </section>
+
+      <section className="field">
+        <span className="field-label">Category</span>
+        <div className="chip-row">
+          {CATEGORIES.map((item) => (
+            <button
+              type="button"
+              key={item}
+              className={`chip ${category === item ? 'chip-active' : ''}`}
+              onClick={() => setCategory(item)}
+            >
+              {item}
+            </button>
+          ))}
         </div>
       </section>
 
@@ -264,6 +557,7 @@ function App() {
               setIsPickerOpen(false);
             }}
             onCreate={createAccount}
+            onDeleteClick={openDeleteDialog}
           />
         )}
       </section>
@@ -294,7 +588,7 @@ function App() {
           id="note-input"
           className="note-input"
           type="text"
-          placeholder="What was this payment for?"
+          placeholder={transactionType === 'credit' ? 'What was this income for?' : 'What was this payment for?'}
           value={note}
           onChange={(event) => setNote(event.target.value)}
         />
@@ -303,11 +597,26 @@ function App() {
       {message && <p className="message">{message}</p>}
 
       <button type="button" className="save-button" onClick={savePayment} disabled={isSaving}>
-        <span>{isSaving ? 'Saving...' : 'Save payment'}</span>
+        <span>{isSaving ? 'Saving...' : transactionType === 'credit' ? 'Save credit' : 'Save payment'}</span>
         <span className="plus-symbol">+</span>
       </button>
 
-      <p className="footnote">For your records. No money will be moved.</p>
+      <p className="footnote">
+        {transactionType === 'credit'
+          ? 'Recorded as incoming funds. No real money will be moved.'
+          : 'For your records. No money will be moved.'}
+      </p>
+
+      {deletingAccount && (
+        <DeleteAccountDialog
+          account={deletingAccount}
+          paymentCount={deletingPaymentCount}
+          isDeleting={isDeletingAccount}
+          errorMessage={deleteDialogError}
+          onConfirm={confirmDeleteAccount}
+          onCancel={() => setDeletingAccount(null)}
+        />
+      )}
     </div>
   );
 }

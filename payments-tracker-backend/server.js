@@ -1,11 +1,17 @@
+require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
-const db = require('./db');
+const { query, queryOne, runInTransaction, initDatabase } = require('./db');
 
 const app = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 const ACCOUNT_TYPES = ['bank', 'upi', 'cash'];
+const TRANSACTION_TYPES = ['debit', 'credit'];
 const MONTH_PATTERN = /^\d{4}-\d{2}$/;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const activeTokens = new Set();
 
 app.use(cors());
 app.use(express.json());
@@ -34,70 +40,161 @@ function resolveAccountId(value) {
   return value ? Number(value) : null;
 }
 
-function buildPaymentFilter(monthKey, accountId) {
-  const conditions = ["strftime('%Y-%m', payment_date) = ?"];
-  const params = [monthKey];
+function resolveTransactionType(value) {
+  if (!value) return null;
+  const normalized = String(value).toLowerCase().trim();
+  return TRANSACTION_TYPES.includes(normalized) ? normalized : null;
+}
+
+function buildConditions({ monthKey, accountId, transactionType }) {
+  const conditions = [];
+  const params = [];
+
+  if (monthKey) {
+    conditions.push('left(payment_date, 7) = ?');
+    params.push(monthKey);
+  }
 
   if (accountId) {
     conditions.push('account_id = ?');
     params.push(accountId);
   }
 
-  return { where: conditions.join(' AND '), params };
+  if (transactionType) {
+    conditions.push('transaction_type = ?');
+    params.push(transactionType);
+  }
+
+  return {
+    whereClause: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '',
+    params,
+  };
 }
 
-app.get('/api/payments', (req, res) => {
-  const accountId = resolveAccountId(req.query.account_id);
-  const rows = accountId
-    ? db.prepare('SELECT * FROM payments WHERE account_id = ? ORDER BY payment_date DESC, id DESC').all(accountId)
-    : db.prepare('SELECT * FROM payments ORDER BY payment_date DESC, id DESC').all();
+function timingSafeEqualStrings(first, second) {
+  const firstBuffer = Buffer.from(String(first));
+  const secondBuffer = Buffer.from(String(second));
+
+  if (firstBuffer.length !== secondBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(firstBuffer, secondBuffer);
+}
+
+app.post('/api/login', (req, res) => {
+  const { pin } = req.body;
+  const configuredPin = process.env.APP_PIN;
+
+  if (!configuredPin || !pin || !timingSafeEqualStrings(pin, configuredPin)) {
+    return res.status(401).json({ error: 'Wrong PIN' });
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  activeTokens.add(token);
+  res.json({ token });
+});
+
+app.use('/api', (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Session expired' });
+  }
+
+  const parts = authHeader.split(' ');
+  const token = parts.length === 2 && /^bearer$/i.test(parts[0]) ? parts[1] : parts[0];
+
+  if (!token || !activeTokens.has(token)) {
+    return res.status(401).json({ error: 'Session expired' });
+  }
+
+  next();
+});
+
+app.get('/api/payments', async (req, res) => {
+  const { whereClause, params } = buildConditions({
+    accountId: resolveAccountId(req.query.account_id),
+    transactionType: resolveTransactionType(req.query.transaction_type),
+  });
+
+  const rows = await query(`SELECT * FROM payments ${whereClause} ORDER BY payment_date DESC, id DESC`, params);
   res.json(rows);
 });
 
-app.post('/api/payments', (req, res) => {
+app.post('/api/payments', async (req, res) => {
   const { amount, category, payment_date, account_id, note } = req.body;
+  const requestedType = req.body.type !== undefined ? req.body.type : req.body.transaction_type;
 
-  if (!amount || amount <= 0 || !category || !payment_date) {
-    return res.status(400).json({ error: 'amount, category and payment_date are required' });
+  const numericAmount = Number(amount);
+  if (!amount || isNaN(numericAmount) || numericAmount <= 0) {
+    return res.status(400).json({ error: 'amount must be a valid number greater than 0' });
   }
 
-  const savedNote = note?.trim() || null;
+  if (!category || typeof category !== 'string' || !category.trim()) {
+    return res.status(400).json({ error: 'category is required' });
+  }
 
-  const result = db
-    .prepare('INSERT INTO payments (amount, category, payment_date, account_id, note) VALUES (?, ?, ?, ?, ?)')
-    .run(amount, category, payment_date, account_id ?? null, savedNote);
+  if (!payment_date || !DATE_PATTERN.test(payment_date)) {
+    return res.status(400).json({ error: 'payment_date must be in YYYY-MM-DD format' });
+  }
+
+  const type = requestedType ? String(requestedType).toLowerCase().trim() : 'debit';
+  if (!TRANSACTION_TYPES.includes(type)) {
+    return res.status(400).json({ error: "type must be either 'debit' or 'credit'" });
+  }
+
+  const savedCategory = category.trim();
+  const savedNote = note?.trim() || null;
+  const savedAccountId = account_id ? Number(account_id) : null;
+
+  const [inserted] = await query(
+    'INSERT INTO payments (amount, category, payment_date, account_id, note, transaction_type) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+    [numericAmount, savedCategory, payment_date, savedAccountId, savedNote, type]
+  );
 
   res.status(201).json({
-    id: result.lastInsertRowid,
-    amount,
-    category,
+    id: inserted.id,
+    amount: numericAmount,
+    category: savedCategory,
     payment_date,
-    account_id: account_id ?? null,
+    account_id: savedAccountId,
     note: savedNote,
+    type,
+    transaction_type: type,
   });
 });
 
-app.delete('/api/payments/:id', (req, res) => {
-  const result = db.prepare('DELETE FROM payments WHERE id = ?').run(req.params.id);
+app.delete('/api/payments/:id', async (req, res) => {
+  const paymentId = Number(req.params.id);
 
-  if (result.changes === 0) {
+  if (!Number.isInteger(paymentId)) {
+    return res.status(404).json({ error: 'Payment not found' });
+  }
+
+  const deleted = await query('DELETE FROM payments WHERE id = ? RETURNING id', [paymentId]);
+
+  if (deleted.length === 0) {
     return res.status(404).json({ error: 'Payment not found' });
   }
 
   res.json({ deleted: true });
 });
 
-app.get('/api/summary', (req, res) => {
-  const accountId = resolveAccountId(req.query.account_id);
-  const rows = accountId
-    ? db
-      .prepare('SELECT category, SUM(amount) AS total FROM payments WHERE account_id = ? GROUP BY category ORDER BY total DESC')
-      .all(accountId)
-    : db.prepare('SELECT category, SUM(amount) AS total FROM payments GROUP BY category ORDER BY total DESC').all();
+app.get('/api/summary', async (req, res) => {
+  const { whereClause, params } = buildConditions({
+    accountId: resolveAccountId(req.query.account_id),
+    transactionType: 'debit',
+  });
+
+  const rows = await query(
+    `SELECT category, SUM(amount)::float8 AS total FROM payments ${whereClause} GROUP BY category ORDER BY total DESC`,
+    params
+  );
   res.json(rows);
 });
 
-app.get('/api/analytics', (req, res) => {
+app.get('/api/analytics', async (req, res) => {
   const monthKey = resolveMonth(req.query.month);
 
   if (!monthKey) {
@@ -106,45 +203,67 @@ app.get('/api/analytics', (req, res) => {
 
   const accountId = resolveAccountId(req.query.account_id);
   const previousMonthKey = shiftMonthKey(monthKey, -1);
-  const currentFilter = buildPaymentFilter(monthKey, accountId);
-  const previousFilter = buildPaymentFilter(previousMonthKey, accountId);
 
-  const totals = db
-    .prepare(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payments WHERE ${currentFilter.where}`)
-    .get(...currentFilter.params);
+  const currentDebit = buildConditions({ monthKey, accountId, transactionType: 'debit' });
+  const currentCredit = buildConditions({ monthKey, accountId, transactionType: 'credit' });
+  const previousDebit = buildConditions({ monthKey: previousMonthKey, accountId, transactionType: 'debit' });
+  const previousCredit = buildConditions({ monthKey: previousMonthKey, accountId, transactionType: 'credit' });
 
-  const previousTotals = db
-    .prepare(`SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE ${previousFilter.where}`)
-    .get(...previousFilter.params);
+  const [debitTotals, creditTotals, previousDebitTotals, previousCreditTotals, categories, largestPayments] =
+    await Promise.all([
+      queryOne(
+        `SELECT COALESCE(SUM(amount), 0)::float8 AS total, COUNT(*)::int AS count FROM payments ${currentDebit.whereClause}`,
+        currentDebit.params
+      ),
+      queryOne(
+        `SELECT COALESCE(SUM(amount), 0)::float8 AS total, COUNT(*)::int AS count FROM payments ${currentCredit.whereClause}`,
+        currentCredit.params
+      ),
+      queryOne(
+        `SELECT COALESCE(SUM(amount), 0)::float8 AS total FROM payments ${previousDebit.whereClause}`,
+        previousDebit.params
+      ),
+      queryOne(
+        `SELECT COALESCE(SUM(amount), 0)::float8 AS total FROM payments ${previousCredit.whereClause}`,
+        previousCredit.params
+      ),
+      query(
+        `SELECT category, SUM(amount)::float8 AS total, COUNT(*)::int AS count FROM payments ${currentDebit.whereClause} GROUP BY category ORDER BY total DESC`,
+        currentDebit.params
+      ),
+      query(
+        `SELECT id, amount, category, payment_date, note, transaction_type FROM payments ${currentDebit.whereClause} ORDER BY amount DESC, id DESC LIMIT 3`,
+        currentDebit.params
+      ),
+    ]);
 
-  const categories = db
-    .prepare(
-      `SELECT category, SUM(amount) AS total, COUNT(*) AS count FROM payments WHERE ${currentFilter.where} GROUP BY category ORDER BY total DESC`
-    )
-    .all(...currentFilter.params);
-
-  const largestPayments = db
-    .prepare(
-      `SELECT id, amount, category, payment_date, note FROM payments WHERE ${currentFilter.where} ORDER BY amount DESC, id DESC LIMIT 3`
-    )
-    .all(...currentFilter.params);
+  const totalDebits = debitTotals.total;
+  const totalCredits = creditTotals.total;
 
   res.json({
     month: monthKey,
     previous_month: previousMonthKey,
-    previous_month_total: previousTotals.total,
-    total_spent: totals.total,
-    payment_count: totals.count,
-    average_payment: totals.count > 0 ? totals.total / totals.count : 0,
+    previous_month_total: previousDebitTotals.total,
+    previous_month_credit: previousCreditTotals.total,
+    total_spent: totalDebits,
+    total_expense: totalDebits,
+    total_debit: totalDebits,
+    total_income: totalCredits,
+    total_credit: totalCredits,
+    net_balance: totalCredits - totalDebits,
+    payment_count: debitTotals.count + creditTotals.count,
+    debit_count: debitTotals.count,
+    credit_count: creditTotals.count,
+    average_payment: debitTotals.count > 0 ? totalDebits / debitTotals.count : 0,
     categories: categories.map((item) => ({
       ...item,
-      share: totals.total > 0 ? (item.total / totals.total) * 100 : 0,
+      share: totalDebits > 0 ? (item.total / totalDebits) * 100 : 0,
     })),
     largest_payments: largestPayments,
   });
 });
 
-app.get('/api/analytics/trend', (req, res) => {
+app.get('/api/analytics/trend', async (req, res) => {
   const endMonth = resolveMonth(req.query.month);
 
   if (!endMonth) {
@@ -157,52 +276,100 @@ app.get('/api/analytics/trend', (req, res) => {
     shiftMonthKey(endMonth, index - (monthCount - 1))
   );
 
-  const conditions = [`strftime('%Y-%m', payment_date) IN (${monthKeys.map(() => '?').join(', ')})`];
-  const params = [...monthKeys];
+  const conditions = ['left(payment_date, 7) = ANY(?)'];
+  const params = [monthKeys];
 
   if (accountId) {
     conditions.push('account_id = ?');
     params.push(accountId);
   }
 
-  const rows = db
-    .prepare(
-      `SELECT strftime('%Y-%m', payment_date) AS month, SUM(amount) AS total FROM payments WHERE ${conditions.join(' AND ')} GROUP BY month`
-    )
-    .all(...params);
+  const rows = await query(
+    `SELECT left(payment_date, 7) AS month,
+            COALESCE(SUM(CASE WHEN transaction_type = 'debit' THEN amount ELSE 0 END), 0)::float8 AS debit_total,
+            COALESCE(SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE 0 END), 0)::float8 AS credit_total
+     FROM payments
+     WHERE ${conditions.join(' AND ')}
+     GROUP BY 1`,
+    params
+  );
 
-  const totalsByMonth = new Map(rows.map((row) => [row.month, row.total]));
+  const totalsByMonth = new Map(rows.map((row) => [row.month, row]));
 
-  res.json(monthKeys.map((monthKey) => ({ month: monthKey, total: totalsByMonth.get(monthKey) ?? 0 })));
+  res.json(
+    monthKeys.map((monthKey) => {
+      const entry = totalsByMonth.get(monthKey);
+      const debitValue = entry ? entry.debit_total : 0;
+      const creditValue = entry ? entry.credit_total : 0;
+      return {
+        month: monthKey,
+        total: debitValue,
+        total_expense: debitValue,
+        total_income: creditValue,
+        debit: debitValue,
+        credit: creditValue,
+      };
+    })
+  );
 });
 
-app.get('/api/accounts', (req, res) => {
-  const rows = db.prepare('SELECT * FROM accounts ORDER BY id').all();
+app.get('/api/accounts', async (req, res) => {
+  const rows = await query('SELECT * FROM accounts ORDER BY id');
   res.json(rows);
 });
 
-app.post('/api/accounts', (req, res) => {
+app.post('/api/accounts', async (req, res) => {
   const { name, type } = req.body;
 
   if (!name || !ACCOUNT_TYPES.includes(type)) {
     return res.status(400).json({ error: 'name and a valid type (bank, upi, cash) are required' });
   }
 
-  const result = db.prepare('INSERT INTO accounts (name, type) VALUES (?, ?)').run(name, type);
+  const trimmedName = name.trim();
+  const [inserted] = await query('INSERT INTO accounts (name, type) VALUES (?, ?) RETURNING id', [trimmedName, type]);
 
-  res.status(201).json({ id: result.lastInsertRowid, name, type });
+  res.status(201).json({ id: inserted.id, name: trimmedName, type });
 });
 
-app.delete('/api/accounts/:id', (req, res) => {
-  const result = db.prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
+app.delete('/api/accounts/:id', async (req, res) => {
+  const accountId = Number(req.params.id);
 
-  if (result.changes === 0) {
+  if (!Number.isInteger(accountId)) {
     return res.status(404).json({ error: 'Account not found' });
   }
 
-  res.json({ deleted: true });
+  const result = await runInTransaction(async (runQuery) => {
+    const existingAccounts = await runQuery('SELECT id FROM accounts WHERE id = ?', [accountId]);
+
+    if (existingAccounts.length === 0) {
+      return null;
+    }
+
+    const deletedPayments = await runQuery('DELETE FROM payments WHERE account_id = ? RETURNING id', [accountId]);
+    await runQuery('DELETE FROM accounts WHERE id = ?', [accountId]);
+
+    return { deleted: true, payments_deleted: deletedPayments.length };
+  });
+
+  if (!result) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  res.json(result);
 });
 
-app.listen(PORT, () => {
-  console.log(`Payments API running on http://localhost:${PORT}`);
+app.use((error, req, res, next) => {
+  console.error(error);
+  res.status(500).json({ error: 'Server error' });
 });
+
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Payments API running on http://localhost:${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error('Could not connect to the database:', error.message);
+    process.exit(1);
+  });
