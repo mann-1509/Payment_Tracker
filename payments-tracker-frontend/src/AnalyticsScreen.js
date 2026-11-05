@@ -236,7 +236,10 @@ export default function AnalyticsScreen({
   };
 
   if (view === 'history') {
-    const historyTotal = history.reduce((sum, payment) => sum + payment.amount, 0);
+    const historyTotal = history.reduce(
+      (sum, payment) => sum + (payment.transaction_type === 'credit' ? -payment.amount : payment.amount),
+      0
+    );
 
     return (
       <div className="screen">

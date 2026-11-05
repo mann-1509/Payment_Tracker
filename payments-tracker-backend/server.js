@@ -282,15 +282,15 @@ app.get('/api/analytics', async (req, res) => {
       ),
     ]);
 
-  const totalDebits = debitTotals.total;
-  const totalCredits = creditTotals.total;
+  const netSpent = totalDebits - totalCredits;
+  const previousNetSpent = previousDebitTotals.total - previousCreditTotals.total;
 
   res.json({
     month: monthKey,
     previous_month: previousMonthKey,
     previous_month_total: previousDebitTotals.total,
     previous_month_credit: previousCreditTotals.total,
-    total_spent: totalDebits,
+    total_spent: netSpent,
     total_expense: totalDebits,
     total_debit: totalDebits,
     total_income: totalCredits,
